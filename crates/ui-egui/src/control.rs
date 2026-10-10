@@ -843,10 +843,34 @@ fn dispatch(app: &mut PhotocraftApp, ctx: &egui::Context, req: &ControlRequest) 
             if clicks > MAX_CLICKS {
                 return err(format!("`count` must be at most {MAX_CLICKS} (got {clicks})"));
             }
+            // Modifier flags may be top-level or grouped under "modifiers" (as for `ui.key`).
+            let m = p.get("modifiers").unwrap_or(p);
+            let flag = |k: &str| m.get(k).and_then(Value::as_bool).unwrap_or(false);
+            let modifiers = egui::Modifiers {
+                command: flag("command"),
+                mac_cmd: cfg!(target_os = "macos") && flag("command"),
+                shift: flag("shift"),
+                alt: flag("alt"),
+                ctrl: flag("ctrl"),
+            };
+            // Any flag given (even false) sets the held modifiers, so a drag can release them.
+            if ["command", "shift", "alt", "ctrl"].iter().any(|k| m.get(*k).is_some()) {
+                app.synthetic.push(egui::Event::ModifiersChanged(modifiers));
+            }
             app.synthetic.push(egui::Event::PointerMoved(pos));
             for _ in 0..clicks {
-                app.synthetic.push(egui::Event::PointerButton { pos, button, pressed: true, modifiers: Default::default() });
-                app.synthetic.push(egui::Event::PointerButton { pos, button, pressed: false, modifiers: Default::default() });
+                app.synthetic.push(egui::Event::PointerButton { pos, button, pressed: true, modifiers });
+                app.synthetic.push(egui::Event::PointerButton { pos, button, pressed: false, modifiers });
+            }
+            // `ui.move {down: true}` … `ui.move` … `ui.move {up: true}` is a real drag, one frame
+            // per call, through egui like the mouse (`ui.pointer` drives the tool directly).
+            if req.method == "ui.move" {
+                if p.get("down").and_then(Value::as_bool).unwrap_or(false) {
+                    app.synthetic.push(egui::Event::PointerButton { pos, button, pressed: true, modifiers });
+                }
+                if p.get("up").and_then(Value::as_bool).unwrap_or(false) {
+                    app.synthetic.push(egui::Event::PointerButton { pos, button, pressed: false, modifiers });
+                }
             }
             ctx.request_repaint();
             Outcome::AfterInput
@@ -1984,5 +2008,28 @@ mod tests {
             assert_eq!(app.synthetic.len(), events);
             app.synthetic.clear();
         }
+    }
+
+    /// `ui.move {down}` … `ui.move {up}` is a drag: a press, moves and a release, each call its own
+    /// frame, with the modifiers given held throughout.
+    #[test]
+    fn ui_move_presses_and_releases_for_real_drags() {
+        let mut app = PhotocraftApp::new(photocraft_engine::Session::new(), crate::Services::default());
+        let ctx = egui::Context::default();
+        let mut queued = |params: Value| {
+            let (req, _rx) = ControlRequest::new("ui.move", params);
+            assert!(matches!(handle(&mut app, &ctx, &req), Outcome::AfterInput));
+            std::mem::take(&mut app.synthetic)
+        };
+        let alt = egui::Modifiers::ALT;
+        let down = queued(json!({"x": 10, "y": 10, "down": true, "alt": true}));
+        assert!(
+            matches!(down[..], [egui::Event::ModifiersChanged(m), egui::Event::PointerMoved(_), egui::Event::PointerButton { pressed: true, modifiers, .. }] if m == alt && modifiers == alt)
+        );
+        assert!(matches!(queued(json!({"x": 20, "y": 10}))[..], [egui::Event::PointerMoved(_)]), "a plain move keeps the modifiers");
+        let up = queued(json!({"x": 30, "y": 10, "up": true, "alt": false}));
+        assert!(
+            matches!(up[..], [egui::Event::ModifiersChanged(m), egui::Event::PointerMoved(_), egui::Event::PointerButton { pressed: false, .. }] if m == egui::Modifiers::NONE)
+        );
     }
 }
