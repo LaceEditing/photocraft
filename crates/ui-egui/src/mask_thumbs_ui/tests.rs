@@ -435,7 +435,8 @@ fn clicking_the_vector_mask_targets_it_for_the_path_tools() {
     assert_eq!(h.state().ui.selected_path.as_deref(), Some("layer"), "the Paths panel selects its path");
     assert!(near(super::brackets(&h.ctx).unwrap(), r.expand(3.0)), "brackets on the vector mask");
     assert_eq!(crate::canvas::paint_target(h.state()), json!("pixels"));
-    // Path Selection moves the vector mask.
+    // Path Selection moves the vector mask, from a press on it.
+    assert!(crate::vector_ui::path_selection_press(h.state_mut(), 30.0, 30.0));
     crate::vector_ui::path_selection_finish(h.state_mut(), [30.0, 30.0], [35.0, 32.0]);
     let k = layer(&h, masked).vector_mask.unwrap().path.subpaths[0].knots[0].anchor;
     assert_eq!((k.x, k.y), (25.0, 12.0));

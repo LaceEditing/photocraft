@@ -336,7 +336,8 @@ pub fn path_to_selection(app: &mut PhotocraftApp, params: Value) -> Result<Value
 // Path Selection
 
 /// What Path Selection edits.
-enum PathTarget {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum PathTarget {
     Shape(u64),
     /// The active layer's vector mask, when its Layers thumbnail is targeted (#196).
     VectorMask(u64),
@@ -388,12 +389,93 @@ pub(crate) fn free_transform_path(app: &PhotocraftApp) -> Option<(Value, Path)> 
     Some((params, path))
 }
 
+/// Is document point `p` on `path`: inside one of its subpaths (even-odd, open ones closed as a
+/// fill closes them) or within `tol` of its outline (unfilled shapes, open paths)?
+fn path_hit(path: &Path, p: photocraft_geom::Point, tol: f64) -> bool {
+    if photocraft_vector::edit::hit(path, p, tol, &[]).is_some() {
+        return true;
+    }
+    let mut inside = false;
+    for sp in &path.subpaths {
+        let mut poly: Vec<photocraft_geom::Point> = Vec::new();
+        for seg in sp.segments() {
+            for k in 0..16 {
+                let t = f64::from(k) / 16.0;
+                let q = bezier([seg[0].x, seg[0].y], [seg[1].x, seg[1].y], [seg[2].x, seg[2].y], [seg[3].x, seg[3].y], t);
+                poly.push(photocraft_geom::Point::new(q[0], q[1]));
+            }
+        }
+        for (i, a) in poly.iter().enumerate() {
+            let b = poly[(i + 1) % poly.len()];
+            if (a.y > p.y) != (b.y > p.y) && p.x < a.x + (p.y - a.y) * (b.x - a.x) / (b.y - a.y) {
+                inside = !inside;
+            }
+        }
+    }
+    inside
+}
+
+/// Path Selection press at document (x, y): like Photoshop's, it takes the path under the
+/// pointer, the topmost visible shape layer's (selecting that layer), else the Work Path, and the
+/// drag moves that one. It used to move the active layer's shape whatever was clicked, so
+/// dragging one shape moved another. With a vector mask targeted only that path is taken. False
+/// when no path is under the pointer: the drag then moves nothing.
+pub fn path_selection_press(app: &mut PhotocraftApp, x: f64, y: f64) -> bool {
+    let tol = 4.0 / app.point_zoom().max(0.01) as f64;
+    let p = photocraft_geom::Point::new(x, y);
+    app.path_drag = None;
+    if let Some((id, path)) = targeted_vector_mask(app) {
+        app.path_drag = path_hit(&path, p, tol).then_some(PathTarget::VectorMask(id));
+        return app.path_drag.is_some();
+    }
+    let Some(st) = app.session.active() else { return false };
+    let doc = &st.doc;
+    let shape = doc.walk().into_iter().rev().find_map(|(path, _, l)| {
+        let LayerContent::Shape(sh) = &l.content else { return None };
+        // The layer and every enclosing group must be visible.
+        let shown = (1..=path.len()).all(|n| path.get(..n).and_then(|p| doc.layer_at(p)).is_some_and(|a| a.visible));
+        (shown && path_hit(&sh.path, p, tol)).then_some(l.id)
+    });
+    let work = doc.work_path.as_ref().is_some_and(|w| path_hit(w, p, tol));
+    let active = st.active_layer;
+    match shape {
+        Some(id) => {
+            if active != Some(id)
+                && let Err(e) = app.run("layer.select", json!({"layer": id.0}))
+            {
+                app.ui.status = e;
+                app.ui.status_error = true;
+                return false;
+            }
+            app.path_drag = Some(PathTarget::Shape(id.0));
+        }
+        None if work => app.path_drag = Some(PathTarget::Work),
+        None => {}
+    }
+    app.path_drag.is_some()
+}
+
 pub fn path_selection_finish(app: &mut PhotocraftApp, start: [f64; 2], end: [f64; 2]) {
     let (dx, dy) = (end[0] - start[0], end[1] - start[1]);
+    let Some(target) = app.path_drag.take() else { return };
     if dx.abs() + dy.abs() < 0.5 {
         return;
     }
-    let Some((target, path)) = target_path(app) else { return };
+    let Some(st) = app.session.active() else { return };
+    let path = match target {
+        PathTarget::Shape(id) => match st.doc.layer(photocraft_doc::LayerId(id)).map(|l| &l.content) {
+            Some(LayerContent::Shape(sh)) => sh.path.clone(),
+            _ => return,
+        },
+        PathTarget::VectorMask(id) => match st.doc.layer(photocraft_doc::LayerId(id)).and_then(|l| l.vector_mask.as_ref()) {
+            Some(m) => m.path.clone(),
+            None => return,
+        },
+        PathTarget::Work => match &st.doc.work_path {
+            Some(w) => w.clone(),
+            None => return,
+        },
+    };
     let _ = match target {
         PathTarget::Shape(id) => app.run("shape.edit", json!({"layer": id, "move": [dx.round(), dy.round()]})),
         PathTarget::VectorMask(id) => {
@@ -1270,6 +1352,37 @@ mod tests {
         assert!(photocraft_engine::vector_cmds::shape_path(&json!({"kind": "rect"})).is_err());
     }
 
+    /// Path Selection moves the shape under the pointer (selecting its layer), not the active
+    /// layer's: dragging one shape used to move another. A drag from empty canvas moves nothing.
+    #[test]
+    fn path_selection_moves_the_shape_under_the_pointer() {
+        let mut app = app();
+        app.ui.extras.snap = false;
+        let mut shape = |rect: [i32; 4]| app.run("shape.create", json!({"kind": "rect", "rect": rect, "fill": "#ff0000"})).unwrap()["layer"].as_u64().unwrap();
+        let (a, b) = (shape([10, 10, 40, 40]), shape([100, 100, 40, 40]));
+        let mut app = app;
+        app.session.execute("layer.select", json!({"layer": a})).unwrap();
+        app.ui.tool = Tool::PathSelection;
+        let corner = |app: &PhotocraftApp, id: u64| {
+            let st = app.session.active().unwrap();
+            let LayerContent::Shape(sh) = &st.doc.layer(photocraft_doc::LayerId(id)).unwrap().content else { panic!("not a shape") };
+            let k = sh.path.subpaths[0].knots[0].anchor;
+            (k.x, k.y)
+        };
+        let (a0, b0) = (corner(&app, a), corner(&app, b));
+        let drag = |app: &mut PhotocraftApp, from: [f64; 2], to: [f64; 2]| {
+            crate::canvas::tool_event(app, crate::canvas::ToolEvent::Down { x: from[0], y: from[1], pressure: 1.0 }, egui::Modifiers::NONE);
+            crate::canvas::tool_event(app, crate::canvas::ToolEvent::Move { x: to[0], y: to[1], pressure: 1.0 }, egui::Modifiers::NONE);
+            crate::canvas::tool_event(app, crate::canvas::ToolEvent::Up { x: to[0], y: to[1] }, egui::Modifiers::NONE);
+        };
+        drag(&mut app, [120.0, 120.0], [130.0, 125.0]);
+        assert_eq!(corner(&app, a), a0, "the active shape stayed");
+        assert_eq!(corner(&app, b), (b0.0 + 10.0, b0.1 + 5.0), "the clicked one moved");
+        assert_eq!(app.session.active().unwrap().active_layer, Some(photocraft_doc::LayerId(b)));
+        drag(&mut app, [70.0, 170.0], [90.0, 180.0]);
+        assert_eq!((corner(&app, a), corner(&app, b)), (a0, (b0.0 + 10.0, b0.1 + 5.0)), "empty canvas: nothing moves");
+    }
+
     #[test]
     fn pen_builds_and_closes_a_work_path() {
         let mut app = app();
@@ -1286,8 +1399,9 @@ mod tests {
         let wp = app.session.active().unwrap().doc.work_path.clone().unwrap();
         assert!(wp.subpaths[0].closed && wp.subpaths[0].knots.len() == 3);
         assert!(wp.subpaths[0].knots[2].smooth);
-        // Path Selection moves it.
-        path_selection_finish(&mut app, [50.0, 50.0], [60.0, 55.0]);
+        // Path Selection moves it, from a press on it.
+        assert!(path_selection_press(&mut app, 80.0, 50.0));
+        path_selection_finish(&mut app, [80.0, 50.0], [90.0, 55.0]);
         let wp = app.session.active().unwrap().doc.work_path.clone().unwrap();
         assert_eq!((wp.subpaths[0].knots[0].anchor.x, wp.subpaths[0].knots[0].anchor.y), (30.0, 25.0));
     }

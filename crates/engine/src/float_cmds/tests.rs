@@ -148,3 +148,27 @@ fn copy_floats_a_duplicate_and_leaves_the_original() {
     let doc = &s.active().unwrap().doc;
     assert!(alpha(doc, id, 12, 12) == 1.0 && alpha(doc, id, 42, 12) == 1.0, "dropped: both");
 }
+
+#[test]
+fn moving_selected_pixels_leaves_no_phantom_bounds() {
+    // The hole the cut leaves must be empty pixels, not transparent red: otherwise the layer's
+    // bounds (Properties, Free Transform, snapping) still cover where the pixels were.
+    let (mut s, id) = session();
+    s.execute("select.float", json!({"dx": 30, "dy": 0})).unwrap();
+    s.execute("select.drop", json!({})).unwrap();
+    let st = s.active().unwrap();
+    assert_eq!(st.doc.layer(id).unwrap().surface().unwrap().content_bounds(), Rect::new(40, 10, 60, 30));
+}
+
+#[test]
+fn selected_area_empty_looks_at_the_layer_pixels_under_the_selection() {
+    let (mut s, id) = session();
+    assert!(!selected_area_empty(&s.active().unwrap().doc, id));
+    s.execute("select.rect", json!({"x": 50, "y": 40, "width": 10, "height": 10})).unwrap();
+    assert!(selected_area_empty(&s.active().unwrap().doc, id));
+    // Overlapping by a single pixel counts.
+    s.execute("select.rect", json!({"x": 29, "y": 29, "width": 10, "height": 10})).unwrap();
+    assert!(!selected_area_empty(&s.active().unwrap().doc, id));
+    s.execute("select.deselect", json!({})).unwrap();
+    assert!(selected_area_empty(&s.active().unwrap().doc, id), "no selection");
+}

@@ -241,6 +241,34 @@ pub fn clipboard_keys(ctx: &egui::Context, typing: bool, raw: &mut egui::RawInpu
     raw.events = out;
 }
 
+/// Does an Esc in `raw` leave a text field or close a menu that had the keyboard? Read before the
+/// frame starts: egui's focus code drops the focused widget as soon as Esc arrives, so by the time
+/// [`handle`] runs the field looks unfocused and the Esc would reach the canvas too (ending a type
+/// edit, cancelling a transform, crop or job) on top of leaving the field.
+pub fn field_escape(ctx: &egui::Context, raw: &egui::RawInput) -> bool {
+    let esc = raw.events.iter().any(|e| matches!(e, egui::Event::Key { key: Key::Escape, pressed: true, modifiers, .. } if !modifiers.any()));
+    esc && (ctx.text_edit_focused() || crate::layer_row_ui::rename_active(ctx) || egui::Popup::is_any_open(ctx))
+}
+
+/// Track a mouse press that closes a menu or drop-down by landing outside it (see
+/// `PhotocraftApp::dismiss_press`). Read before the frame starts, while egui still knows the menu
+/// was open and where its window is: a press inside the menu is the menu's, one on anything
+/// behind it (the canvas, the panels) only closes it.
+pub fn dismiss_press(app: &mut PhotocraftApp, ctx: &egui::Context, raw: &egui::RawInput) {
+    let press = raw.events.iter().find_map(|e| match e {
+        egui::Event::PointerButton { pos, pressed: true, .. } => Some(*pos),
+        _ => None,
+    });
+    let released = raw.events.iter().any(|e| matches!(e, egui::Event::PointerButton { pressed: false, .. }));
+    if let Some(pos) = press {
+        let open = egui::Popup::is_any_open(ctx) || crate::menu_nav::is_open(ctx);
+        app.dismiss_press = open && ctx.layer_id_at(pos).is_none_or(|l| l.order == egui::Order::Background);
+    } else if app.released_last_frame {
+        app.dismiss_press = false;
+    }
+    app.released_last_frame = released;
+}
+
 pub fn handle(app: &mut PhotocraftApp, ctx: &egui::Context) {
     // Camera Raw is modal like Photoshop's filter dialog: no application shortcut (Save, Undo,
     // tools) runs beneath it, and it handles its own keys (Y, U, O, S). Unlike the other dialogs
@@ -260,11 +288,12 @@ pub fn handle(app: &mut PhotocraftApp, ctx: &egui::Context) {
     // Liquify is a full-window custom dialog with focusable sliders. egui can therefore claim
     // keyboard input before the distortion-mode handler below runs. Give Liquify's local
     // shortcuts first refusal (Undo, brush size, tool keys), but never steal keys from text edits.
-    if app.distort.liquify.is_some() && !ctx.text_edit_focused() {
+    if app.distort.liquify.is_some() && !ctx.text_edit_focused() && !app.field_escape {
         crate::liquify_ui::keys(app, ctx);
     }
     use crate::shortcut_dispatch::{Focus, dispatch_pressed};
-    let focus = Focus::of(ctx);
+    // The Esc that leaves a field (or closes a menu) is the field's alone.
+    let focus = if app.field_escape { Focus::Text } else { Focus::of(ctx) };
     // Dialogs (and Liquify's panel while one of its controls has focus) keep canvas zoom; a
     // focused text field keeps its keys.
     let liquify_focus = app.distort.liquify.is_some() && focus != Focus::None;
@@ -434,6 +463,90 @@ pub fn handle(app: &mut PhotocraftApp, ctx: &egui::Context) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Esc in a focused field (the Type options bar's size, a font search) leaves the field only:
+    /// egui drops the focus as Esc arrives, and the Esc used to end the type edit too, after
+    /// which typing ran tool shortcuts and Backspace deleted the type layer.
+    #[test]
+    fn esc_in_a_field_leaves_the_field_not_the_type_edit() {
+        let ctx = egui::Context::default();
+        let mut app = PhotocraftApp::new(photocraft_engine::Session::new(), Default::default());
+        app.run("file.new", serde_json::json!({"width": 200, "height": 200})).unwrap();
+        app.ui.tool = crate::state::Tool::Type;
+        let layer = app.run("type.create", serde_json::json!({"text": "Hi", "x": 20, "y": 60})).unwrap()["layer"].as_u64().unwrap();
+        app.ui.text_edit =
+            Some(crate::state::TextEdit { layer, caret: 2, anchor: 2, session: "s".into(), created: false, dragging: false, resize: None, preedit: None });
+        let field = egui::Id::new("size-field");
+        let mut text = String::from("72");
+        let mut frame = |app: &mut PhotocraftApp, events: Vec<egui::Event>, hook: bool| {
+            let raw = egui::RawInput { events, ..Default::default() };
+            // What `raw_input_hook` does before the frame starts.
+            app.field_escape = hook && field_escape(&ctx, &raw);
+            ctx.begin_pass(raw);
+            handle(app, &ctx);
+            egui::Area::new(egui::Id::new("fields")).show(&ctx, |ui| {
+                let r = ui.add(egui::TextEdit::singleline(&mut text).id(field));
+                // Clicked into between the Esc presses.
+                if ui.input(|i| i.events.is_empty()) && !r.has_focus() {
+                    r.request_focus();
+                }
+            });
+            ctx.end_pass().textures_delta.clear();
+        };
+        let esc = || vec![egui::Event::Key { key: Key::Escape, physical_key: None, pressed: true, repeat: false, modifiers: Modifiers::NONE }];
+        frame(&mut app, vec![], true);
+        frame(&mut app, vec![], true);
+        assert!(ctx.text_edit_focused(), "the field has the keyboard");
+        frame(&mut app, esc(), true);
+        assert!(app.ui.text_edit.is_some(), "Esc left the field, the type edit goes on");
+        // Without the hook's note the same Esc ends the edit (the bug).
+        frame(&mut app, vec![], true);
+        assert!(ctx.text_edit_focused());
+        frame(&mut app, esc(), false);
+        assert!(app.ui.text_edit.is_none());
+    }
+
+    /// A press outside an open drop-down only closes it: the canvas ignores that press until its
+    /// release (it used to also start type, paint or move under the menu), and the next one works.
+    #[test]
+    fn a_press_that_closes_a_menu_is_not_the_canvas() {
+        let ctx = egui::Context::default();
+        let mut app = PhotocraftApp::new(photocraft_engine::Session::new(), Default::default());
+        let popup = egui::Id::new("font-menu");
+        let menu_rect = egui::Rect::from_min_size(egui::pos2(10.0, 10.0), egui::vec2(100.0, 100.0));
+        let button = |pos, pressed| egui::Event::PointerButton { pos, button: egui::PointerButton::Primary, pressed, modifiers: Modifiers::NONE };
+        let frame = |app: &mut PhotocraftApp, events: Vec<egui::Event>, open: bool| {
+            let raw = egui::RawInput { events, screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(800.0, 600.0))), ..Default::default() };
+            dismiss_press(app, &ctx, &raw);
+            ctx.begin_pass(raw);
+            egui::Area::new(egui::Id::new("canvas")).order(egui::Order::Background).fixed_pos(egui::Pos2::ZERO).show(&ctx, |ui| {
+                ui.allocate_space(egui::vec2(800.0, 600.0));
+            });
+            if open {
+                egui::Popup::open_id(&ctx, popup);
+                egui::Area::new(popup).order(egui::Order::Foreground).fixed_pos(menu_rect.min).show(&ctx, |ui| {
+                    ui.allocate_space(menu_rect.size());
+                });
+            }
+            ctx.end_pass().textures_delta.clear();
+        };
+        let (inside, canvas) = (egui::pos2(50.0, 50.0), egui::pos2(400.0, 300.0));
+        // An area is measured invisibly the first time it shows.
+        frame(&mut app, vec![], true);
+        frame(&mut app, vec![], true);
+        frame(&mut app, vec![button(inside, true), button(inside, false)], true);
+        assert!(!app.dismiss_press, "a click in the menu is the menu's");
+        frame(&mut app, vec![button(canvas, true)], true);
+        assert!(app.dismiss_press, "the press that closes the menu");
+        frame(&mut app, vec![], false);
+        assert!(app.dismiss_press, "held: still ignored");
+        frame(&mut app, vec![button(canvas, false)], false);
+        assert!(app.dismiss_press, "its release too");
+        frame(&mut app, vec![], false);
+        assert!(!app.dismiss_press);
+        frame(&mut app, vec![button(canvas, true), button(canvas, false)], false);
+        assert!(!app.dismiss_press, "the next press is the canvas's");
+    }
 
     #[test]
     fn pen_command_z_and_backspace_retract_points_before_document_undo() {

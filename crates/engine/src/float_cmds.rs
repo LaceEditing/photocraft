@@ -65,6 +65,12 @@ impl CutParts {
                 }
                 if !copy && !fill {
                     r[a] *= 1.0 - k;
+                    // A pixel cut out entirely is the empty pixel, colour included: one keeping
+                    // its colour would still count as content (the layer's bounds, Free
+                    // Transform's box and snapping would keep the hole's edges).
+                    if r[a] <= 0.0 {
+                        r.fill(0.0);
+                    }
                 }
             }
             rest.write_region(b, &rp);
@@ -112,6 +118,30 @@ pub fn floating(st: &DocState) -> Option<&Floating> {
 pub fn displayed(st: &DocState, extra: (i32, i32)) -> Option<Document> {
     let f = floating(st)?;
     f.parts.moved(&st.doc, f.offset.0 + extra.0, f.offset.1 + extra.1).ok()
+}
+
+/// Does the selection of `doc` hold none of `layer`'s pixels (Photoshop: "the selected area is
+/// empty")? True for a layer without pixels. Scans row by row and stops at the first pixel found.
+pub fn selected_area_empty(doc: &Document, layer: LayerId) -> bool {
+    let (Some(sel), Some(l)) = (doc.selection.as_ref(), doc.layer(layer)) else { return true };
+    let LayerContent::Raster(surf) = &l.content else { return true };
+    let b = sel.content_bounds().intersect(&surf.content_bounds());
+    if b.is_empty() {
+        return true;
+    }
+    let alpha = surf.format().alpha.then(|| surf.format().channels() - 1);
+    let w = usize::try_from(b.width()).unwrap_or(0);
+    let (mut k, mut a) = (vec![0.0; w], vec![1.0; w]);
+    for y in b.y0..b.y1 {
+        sel.sample_row_strided(y, b.x0, 1, 0, &mut k);
+        if let Some(c) = alpha {
+            surf.sample_row_strided(y, b.x0, 1, c, &mut a);
+        }
+        if k.iter().zip(&a).any(|(k, a)| k * a > 0.0) {
+            return false;
+        }
+    }
+    true
 }
 
 fn int_param(p: &Value, key: &str) -> i32 {

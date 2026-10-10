@@ -2555,7 +2555,7 @@ pub fn canvas_view(app: &mut PhotocraftApp, ui: &mut egui::Ui, idx: usize, rect:
         view.center[1] -= d.y;
         // The tool cursors below are skipped while panning: the fist is set here (#2196).
         ctx.set_cursor_icon(crate::tool_cursor::hand(&ctx, true));
-    } else if primary {
+    } else if primary && !app.dismiss_press {
         let mods = ui.input(|i| i.modifiers);
         // An ⌥-click the window manager took never arrives; say so (alt_grab.rs).
         crate::alt_grab::watch(app, &ctx, egui::Id::new(("pc-alt-grab", idx)), rect, tool, !under_dialog);
@@ -2813,6 +2813,27 @@ pub fn canvas_view(app: &mut PhotocraftApp, ui: &mut egui::Ui, idx: usize, rect:
         }
         if tool.is_type() && response.double_clicked() && !crate::type_transform::visible(app, crate::workspace_ui::sticky_mods(app, mods)) {
             crate::type_tool::select_word(app);
+        }
+        // Move tool: a double-click on type edits it (Photoshop CC 2019 on), as a double-click on
+        // its Layers thumbnail does: the Type tool, all its text selected.
+        if tool == Tool::Move
+            && app.ui.transform.is_none()
+            && response.double_clicked()
+            && let Some(p) = response.interact_pointer_pos()
+        {
+            let d = xf.to_doc(p);
+            let (px, py) = (d[0].floor().clamp(-1e7, 1e7) as i32, d[1].floor().clamp(-1e7, 1e7) as i32);
+            let hit = app.session.active().and_then(|st| {
+                let id = photocraft_engine::pick_cmds::layers_at(&st.doc, px, py).into_iter().next()?;
+                matches!(st.doc.layer(id)?.content, photocraft_doc::LayerContent::Text(_)).then_some(id)
+            });
+            if let Some(id) = hit {
+                let _ = app.session.select_layer(id);
+                if let Err(e) = crate::type_tool::edit_active(app) {
+                    app.ui.status = e;
+                    app.ui.status_error = true;
+                }
+            }
         }
         if app.ui.extras.grid && app.ui.view.extras {
             crate::rulers::draw_grid(app, &painter, &xf, &doc);
@@ -3729,9 +3750,11 @@ pub fn tool_event(app: &mut PhotocraftApp, ev: ToolEvent, mods: egui::Modifiers)
                 app.guide_drag = Some(crate::rulers::GuideDrag { vertical, index: Some(i), pos: if vertical { x } else { y } });
                 return;
             }
-            // Auto-Select (or ⌘-click while it is off) picks the layer under the pointer first
-            // (not when the selected pixels move: those are the active layer's).
-            if !crate::move_ui::moves_selected_pixels(app) && app.ui.tool_options.move_auto_select != mods.command {
+            // Auto-Select (or ⌘-click while it is off) picks the layer under the pointer first;
+            // with a selection only where `picks_with_selection` says (a press on the piece
+            // being moved keeps moving it).
+            let pixels = crate::move_ui::moves_selected_pixels(app);
+            if app.ui.tool_options.move_auto_select != mods.command && (!pixels || crate::move_ui::picks_with_selection(app, x, y)) {
                 let target = app.ui.tool_options.move_target.clone();
                 let mode = if mods.shift { "add" } else { "replace" };
                 let _ = app.run("layer.pickAt", json!({"x": x, "y": y, "target": target, "mode": mode}));
@@ -3744,6 +3767,16 @@ pub fn tool_event(app: &mut PhotocraftApp, ev: ToolEvent, mods: egui::Modifiers)
             // With a selection: cut the selected pixels (⌥ copies them) and drag them as a floating
             // piece, from anywhere, as a marquee ⌘-drag does.
             if crate::move_ui::moves_selected_pixels(app) {
+                // Nothing of this layer is selected: Photoshop refuses rather than move nothing.
+                let empty = app.session.active().is_some_and(|st| {
+                    photocraft_engine::float_cmds::floating(st).is_none()
+                        && st.active_layer.is_some_and(|id| photocraft_engine::float_cmds::selected_area_empty(&st.doc, id))
+                });
+                if empty {
+                    app.ui.status = "Could not use the Move tool because the selected area is empty.".into();
+                    app.ui.status_error = true;
+                    return;
+                }
                 if crate::move_ui::float_selected(app, mods.alt, 0.0, 0.0) {
                     let mut d = Drag::new(tool, [x, y], vec![[x, y, pressure as f64]], mods, false);
                     d.sel_move = Some(true);
@@ -3867,6 +3900,8 @@ pub fn tool_event(app: &mut PhotocraftApp, ev: ToolEvent, mods: egui::Modifiers)
                     return;
                 }
                 Tool::Type | Tool::VerticalType if crate::type_tool::pointer_down(app, x, y, mods.shift) => return,
+                // Nothing under the pointer: no drag, so nothing moves.
+                Tool::PathSelection if !crate::vector_ui::path_selection_press(app, x, y) => return,
                 _ => {}
             }
             crate::paint_mouse::sync_tool_brush(app);

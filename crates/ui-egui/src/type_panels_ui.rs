@@ -405,7 +405,7 @@ fn options_editor(app: &mut PhotocraftApp, ui: &mut egui::Ui, paragraph: bool, s
                     let unit = if kind == "num" { "" } else { " pt" };
                     if auto {
                         ui.label(RichText::new(tl!("Auto")).color(t.text_dim).size(11.5));
-                    } else if crate::widgets::value_field(ui, &mut x, range, unit, 70.0).changed() {
+                    } else if crate::widgets::value_field_committed(ui, &mut x, range, unit, 70.0).changed() {
                         set = Some(json!({ key: x }));
                     }
                 }
@@ -458,7 +458,7 @@ fn options_editor(app: &mut PhotocraftApp, ui: &mut egui::Ui, paragraph: bool, s
                     }
                     "pt" => {
                         let mut x = v.as_f64().unwrap_or(0.0) as f32;
-                        if crate::widgets::value_field(ui, &mut x, -1296.0..=1296.0, " pt", 70.0).changed() {
+                        if crate::widgets::value_field_committed(ui, &mut x, -1296.0..=1296.0, " pt", 70.0).changed() {
                             set = Some(json!({ key: x }));
                         }
                     }

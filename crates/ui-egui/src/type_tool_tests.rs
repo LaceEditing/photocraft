@@ -19,7 +19,13 @@ fn harness(ppp: f32, app: PhotocraftApp) -> Harness<'static, PhotocraftApp> {
 }
 
 fn make_harness(ppp: f32, app: PhotocraftApp, render: bool) -> Harness<'static, PhotocraftApp> {
-    let builder = Harness::builder().with_size(vec2(1200.0, 800.0)).with_pixels_per_point(ppp);
+    make_harness_with(ppp, app, render, 0.25)
+}
+
+/// [`make_harness`] stepping `dt` seconds a frame (egui's double-click needs both clicks within
+/// 0.3 s; kittest's default frame is 0.25 s).
+fn make_harness_with(ppp: f32, app: PhotocraftApp, render: bool, dt: f32) -> Harness<'static, PhotocraftApp> {
+    let builder = Harness::builder().with_size(vec2(1200.0, 800.0)).with_pixels_per_point(ppp).with_step_dt(dt);
     let builder = if render { builder.wgpu() } else { builder };
     let mut h = builder.build_ui_state(
         |ui, app: &mut PhotocraftApp| {
@@ -1461,4 +1467,109 @@ mod multi_layer_formatting {
             assert_eq!(style(h.state(), id, 0), expected);
         }
     }
+}
+
+/// New type takes the options bar's Anti-aliasing, the tool's default Sharp included (it used to
+/// skip Sharp and leave the model's default, Smooth, while the bar went on showing Sharp).
+#[test]
+fn new_type_takes_the_options_bar_anti_aliasing() {
+    for aa in ["sharp", "none", "smooth", "strong"] {
+        let mut app = new_app();
+        app.ui.tool_options.type_aa = aa.into();
+        super::pointer_up(&mut app, [100.0, 200.0], [100.0, 200.0]);
+        let id = LayerId(app.ui.text_edit.as_ref().unwrap().layer);
+        assert_eq!(photocraft_engine::type_extra_cmds::aa_name(text(&app, id).antialias), aa);
+    }
+}
+
+/// Photoshop's type keys format the text being edited instead of reaching the menus: ⇧⌘L used to
+/// run Image › Auto Tone, ⇧⌘C Copy Merged, ⇧⌘B Auto Color mid-sentence.
+#[test]
+fn type_keys_format_the_text_being_edited() {
+    let mut app = new_app();
+    let id = LayerId(app.run("type.create", json!({"text": "Hello world", "x": 100, "y": 200, "size": 20})).unwrap()["layer"].as_u64().unwrap());
+    let edit = |caret, anchor| crate::state::TextEdit {
+        layer: id.0,
+        caret,
+        anchor,
+        session: "s".into(),
+        created: false,
+        dragging: false,
+        resize: None,
+        preedit: None,
+    };
+    app.ui.text_edit = Some(edit(11, 6));
+    let ctx = egui::Context::default();
+    let press = |app: &mut PhotocraftApp, key, modifiers| {
+        let raw = egui::RawInput {
+            events: vec![egui::Event::ModifiersChanged(modifiers), egui::Event::Key { key, physical_key: None, pressed: true, repeat: false, modifiers }],
+            ..Default::default()
+        };
+        ctx.begin_pass(raw);
+        crate::shortcuts::handle(app, &ctx);
+        ctx.end_pass().textures_delta.clear();
+    };
+    let cs = Modifiers::COMMAND | Modifiers::SHIFT;
+    let steps = app.session.active().unwrap().history.past_len();
+    // Size of the selection ("world") only, from each run's own size: +2, +10 with ⌥, −2.
+    press(&mut app, egui::Key::Period, cs);
+    assert_eq!((size_at(&app, id, 0), size_at(&app, id, 6)), (20.0, 22.0));
+    press(&mut app, egui::Key::Period, cs | Modifiers::ALT);
+    press(&mut app, egui::Key::Comma, cs);
+    assert_eq!((size_at(&app, id, 0), size_at(&app, id, 6)), (20.0, 30.0));
+    // Toggles from the style at the selection start.
+    press(&mut app, egui::Key::B, cs);
+    let bold = |app: &PhotocraftApp, ci: usize| {
+        let t = text(app, id);
+        let b = t.text.char_indices().nth(ci).map_or(t.text.len(), |(b, _)| b);
+        let mut at = 0;
+        t.char_runs()
+            .into_iter()
+            .find(|r| {
+                at += r.len;
+                b < at
+            })
+            .is_some_and(|r| r.style.faux_bold)
+    };
+    assert!(!bold(&app, 0) && bold(&app, 6));
+    press(&mut app, egui::Key::B, cs);
+    assert!(!bold(&app, 6), "⇧⌘B again turns it off");
+    // No selection: the whole layer. ⇧⌘C centres the paragraph (and runs no Copy Merged).
+    app.ui.text_edit = Some(edit(3, 3));
+    press(&mut app, egui::Key::C, cs);
+    let t = text(&app, id);
+    assert_eq!(t.paragraph_runs()[0].style.align, photocraft_doc::text::TextAlign::Center);
+    assert!(app.session.clipboard.is_none(), "no Copy Merged");
+    // ⌥↓ loosens the leading by 2 pt from auto (1.2 × size), ⇧⌥↑ raises the baseline.
+    press(&mut app, egui::Key::ArrowDown, Modifiers::ALT);
+    let lead = |app: &PhotocraftApp| text(app, id).char_runs()[0].style.leading_pt;
+    assert_eq!(lead(&app), Some(26.0));
+    press(&mut app, egui::Key::ArrowUp, Modifiers::ALT | Modifiers::SHIFT);
+    assert_eq!(text(&app, id).char_runs()[0].style.baseline_shift_pt, 2.0);
+    assert_eq!(app.ui.text_edit.as_ref().map(|e| e.caret), Some(3), "the caret didn't move");
+    // Every change shares the editing session's history step.
+    assert!(app.session.active().unwrap().history.past_len() <= steps + 1);
+}
+
+/// Photoshop CC 2019 on: a double-click on type with the Move tool edits it (Type tool, all of
+/// its text selected), as a double-click on the layer's thumbnail does. A single click doesn't.
+#[test]
+fn move_tool_double_click_on_type_edits_it() {
+    let mut app = new_app();
+    let id = LayerId(app.run("type.create", json!({"text": "Hello", "x": 200, "y": 300, "size": 60})).unwrap()["layer"].as_u64().unwrap());
+    app.run("layer.new.layer", json!({})).unwrap();
+    app.ui.tool = crate::state::Tool::Move;
+    app.ui.extras.snap = false;
+    let mut h = make_harness_with(1.0, app, false, 1.0 / 60.0);
+    let p = glyph(&mut h, id, 0, 0.2);
+    click(&mut h, p);
+    assert!(h.state().ui.text_edit.is_none(), "a single click doesn't edit");
+    assert_eq!(h.state().session.active().unwrap().active_layer, Some(id), "Auto-Select picked the type");
+    // Far enough from the first click that egui doesn't count a triple-click.
+    h.run_steps(60);
+    click(&mut h, p);
+    click(&mut h, p);
+    assert_eq!(h.state().ui.tool, crate::state::Tool::Type);
+    assert_eq!(selection(&h), (0, 5), "editing, all the text selected");
+    assert_eq!(h.state().ui.text_edit.as_ref().map(|e| e.layer), Some(id.0));
 }

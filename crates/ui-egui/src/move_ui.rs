@@ -36,6 +36,29 @@ pub(crate) fn moves_selected_pixels_with(app: &PhotocraftApp, tool: Tool) -> boo
         && app.session.is_enabled("select.float")
 }
 
+/// With a selection, does Auto-Select pick the layer under a Move press at document (x, y) before
+/// the selected pixels are dragged? Photoshop picks on every press, so a drag that starts on
+/// another layer moves that layer's selected pixels, not the piece already moved (which used to
+/// jump to wherever the next drag was made). Two exceptions keep the press on the active layer:
+/// inside the selection (or on the floating piece) while the active layer has pixels there, and
+/// outside it where only the Background is under the pointer (a click on empty canvas would
+/// otherwise cut the Background's selected pixels).
+pub(crate) fn picks_with_selection(app: &PhotocraftApp, x: f64, y: f64) -> bool {
+    let Some(st) = app.session.active() else { return false };
+    let Some(sel) = st.doc.selection.as_ref() else { return false };
+    let floating = photocraft_engine::float_cmds::floating(st);
+    // The selection outline travels with a floating piece (it moves for real at the drop).
+    let off = floating.map_or((0, 0), |f| f.offset);
+    let (px, py) = (x.floor().clamp(-1e7, 1e7) as i32, y.floor().clamp(-1e7, 1e7) as i32);
+    let inside = sel.sample_channel(px.saturating_sub(off.0), py.saturating_sub(off.1), 0) > 0.0;
+    let active = st.active_layer;
+    if inside {
+        return floating.is_none() && active.is_none_or(|id| photocraft_engine::float_cmds::selected_area_empty(&st.doc, id));
+    }
+    let hit = photocraft_engine::pick_cmds::layers_at(&st.doc, px, py).into_iter().find(|id| !st.doc.effective_locks(*id).all);
+    hit.is_some_and(|id| Some(id) != active && st.doc.layer(id).is_some_and(|l| !photocraft_engine::extra_cmds::is_background(l)))
+}
+
 /// Floats the selected pixels and moves them by (dx, dy) (`select.float`): cuts them the first
 /// time, or with `copy` (⌥) floats a duplicate and leaves them; `copy` on a piece already floating
 /// drops it where it is and floats a copy of it. False when it failed (reported in the status bar).
@@ -399,6 +422,66 @@ mod tests {
         app.run("select.drop", json!({})).unwrap();
         assert!(alpha(&app, id, 10, 10) == 0.0 && alpha(&app, id, 18, 20) == 1.0 && alpha(&app, id, 34, 20) == 1.0);
         assert_eq!(alpha(&app, id, 48, 16), 1.0, "the layer itself didn't move");
+    }
+
+    /// Red square (8..24)² on "Red", the active layer, blue one (40..56)×(8..24) on "Blue" above
+    /// it; the red square selected.
+    fn two_layers() -> (PhotocraftApp, photocraft_doc::LayerId, photocraft_doc::LayerId) {
+        let (mut app, red) = selected_pixels(8);
+        app.session.execute("select.rect", json!({"x": 40, "y": 8, "width": 16, "height": 16})).unwrap();
+        app.session.execute("edit.clear", json!({})).unwrap();
+        let blue = photocraft_doc::LayerId(app.session.execute("layer.new.layer", json!({"name": "Blue"})).unwrap()["layer"].as_u64().unwrap());
+        app.session.execute("edit.fill", json!({"color": "#0000ff"})).unwrap();
+        app.session.execute("layer.select", json!({"layer": red.0})).unwrap();
+        app.session.execute("select.rect", json!({"x": 8, "y": 8, "width": 16, "height": 16})).unwrap();
+        (app, red, blue)
+    }
+
+    fn active(app: &PhotocraftApp) -> Option<photocraft_doc::LayerId> {
+        app.session.active().unwrap().active_layer
+    }
+
+    /// After the red square was moved, a drag that starts on the blue square (another layer,
+    /// outside the selection) used to move the red piece again, from wherever it began. Auto-Select
+    /// now picks the blue layer, as Photoshop does, and the drag moves its selected pixels: none,
+    /// so nothing moves and the status bar says why.
+    #[test]
+    fn a_drag_on_another_layer_does_not_move_the_floating_piece() {
+        let (mut app, red, blue) = two_layers();
+        drag(&mut app, [16.0, 16.0], [16.0, 36.0], egui::Modifiers::NONE);
+        assert_eq!(offset(&app), Some((0, 20)), "the red square floats 20 px down");
+        drag(&mut app, [48.0, 16.0], [58.0, 16.0], egui::Modifiers::NONE);
+        assert_eq!(active(&app), Some(blue), "Auto-Select picked the blue layer");
+        assert_eq!(offset(&app), None, "the red piece was dropped where it was shown");
+        assert!(alpha(&app, red, 16, 36) == 1.0 && alpha(&app, red, 16, 10) == 0.0, "red stayed 20 px down");
+        assert!(alpha(&app, blue, 48, 16) == 1.0 && alpha(&app, blue, 58, 16) == 0.0, "blue didn't move");
+        assert!(app.ui.status_error && app.ui.status.contains("selected area is empty"), "{}", app.ui.status);
+        // A drag on the piece itself still moves it (no pick there).
+        app.session.execute("layer.select", json!({"layer": red.0})).unwrap();
+        drag(&mut app, [16.0, 36.0], [26.0, 36.0], egui::Modifiers::NONE);
+        assert_eq!((active(&app), offset(&app)), (Some(red), Some((10, 0))));
+        // Auto-Select off: the drag moves the active layer's selected pixels from anywhere.
+        app.run("select.drop", json!({})).unwrap();
+        app.ui.tool_options.move_auto_select = false;
+        drag(&mut app, [48.0, 16.0], [48.0, 20.0], egui::Modifiers::NONE);
+        assert_eq!((active(&app), offset(&app)), (Some(red), Some((0, 4))));
+    }
+
+    /// Inside the selection over pixels of another layer, while the active layer has none there,
+    /// Auto-Select picks that layer and its selected pixels move (they used to stay put while an
+    /// empty piece of the active layer was dragged).
+    #[test]
+    fn inside_the_selection_auto_select_picks_when_the_active_layer_has_nothing_there() {
+        let (mut app, red, blue) = two_layers();
+        app.session.execute("layer.select", json!({"layer": blue.0})).unwrap();
+        drag(&mut app, [16.0, 16.0], [26.0, 16.0], egui::Modifiers::NONE);
+        assert_eq!((active(&app), offset(&app)), (Some(red), Some((10, 0))));
+        // On the layer's own pixels the active layer keeps the press, even with layers above.
+        app.run("select.drop", json!({})).unwrap();
+        app.session.execute("select.rect", json!({"x": 40, "y": 8, "width": 16, "height": 16})).unwrap();
+        app.session.execute("layer.select", json!({"layer": blue.0})).unwrap();
+        drag(&mut app, [48.0, 16.0], [48.0, 26.0], egui::Modifiers::NONE);
+        assert_eq!((active(&app), offset(&app)), (Some(blue), Some((0, 10))));
     }
 
     /// Without floatable pixels (a position-locked layer) the Move tool behaves as without a

@@ -293,6 +293,7 @@ pub fn tick(app: &mut PhotocraftApp, ctx: &egui::Context) {
     ctx.request_repaint_after(std::time::Duration::from_millis(16));
     if let Some(job) = job_in_view(app)
         && !ctx.text_edit_focused()
+        && !app.field_escape
         && ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape))
     {
         cancel(app, job.id);

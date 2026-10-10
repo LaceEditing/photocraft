@@ -278,7 +278,9 @@ pub fn pointer_up(app: &mut PhotocraftApp, start: [f64; 2], end: [f64; 2]) {
     if let Ok(v) = app.run("type.create", p)
         && let Some(id) = v.get("layer").and_then(serde_json::Value::as_u64)
     {
-        if o.type_aa != "sharp" {
+        // `type.create` makes the document model's default (Smooth); any other choice in the
+        // options bar (Sharp is the tool's default, as in Photoshop) is set on the new layer.
+        if o.type_aa != photocraft_engine::type_extra_cmds::aa_name(photocraft_doc::text::AntiAlias::default()) {
             let _ = app.run("type.edit", json!({"layer": id, "antialias": o.type_aa, "coalesce": key}));
         }
         // Like Photoshop: the placeholder is selected, so typing replaces it.
@@ -470,6 +472,11 @@ pub fn handle_keys(app: &mut PhotocraftApp, ctx: &egui::Context) -> bool {
             }
             egui::Event::Key { key, pressed: true, modifiers: m, .. } => {
                 use egui::Key;
+                // Photoshop's type keys (⇧⌘L align, ⇧⌘> size, ⌥↑ leading…) format the text
+                // being edited; they used to reach the menus (⇧⌘L ran Image › Auto Tone).
+                if format_key(app, ctx, *key, *m) {
+                    continue;
+                }
                 let key = &flow_key(*key, vertical_flow);
                 match key {
                     Key::Backspace | Key::Delete => {
@@ -568,6 +575,116 @@ pub fn handle_keys(app: &mut PhotocraftApp, ctx: &egui::Context) -> bool {
         });
     }
     app.ui.text_edit.is_some()
+}
+
+/// Photoshop's keyboard formatting while type is edited (Edit › Keyboard Shortcuts › Tools, "Keys
+/// for type" in Adobe's table), applied to the selected characters, else the whole layer, in the
+/// editing session's history step:
+///
+/// - ⇧⌘L / ⇧⌘C / ⇧⌘R align left / centre / right (top / centre / bottom for vertical type),
+///   ⇧⌘J justifies with the last line left, ⇧⌘F justifies all lines.
+/// - ⇧⌘> / ⇧⌘< type size ±2 pt, ±10 with ⌥; ⌥↑ / ⌥↓ leading ∓2 pt (tighter / looser), ±10 with
+///   ⌘; ⇧⌥↑ / ⇧⌥↓ baseline shift ±2 pt, ±10 with ⌘. Each run keeps its own size.
+/// - ⇧⌘B faux bold, ⇧⌘I faux italic, ⇧⌘U underline, ⇧⌘/ strikethrough, ⇧⌘K all caps, ⇧⌘H
+///   small caps: toggles, from the style at the start of the selection.
+/// - ⇧⌘X horizontal scale 100%, ⌥⇧⌘X vertical scale 100%, ⌥⇧⌘A auto leading, ⇧⌘Q tracking 0.
+///
+/// True when `key` was one of them (the caller then drops the press).
+fn format_key(app: &mut PhotocraftApp, ctx: &egui::Context, key: egui::Key, m: egui::Modifiers) -> bool {
+    use egui::Key;
+    let Some(ed) = app.ui.text_edit.clone() else { return false };
+    let id = LayerId(ed.layer);
+    let (cmd, shift, alt) = (m.command, m.shift, m.alt);
+    // ⌥↑ / ⌥↓ (leading) and ⇧⌥↑ / ⇧⌥↓ (baseline shift); ⌘ for five times the step.
+    if alt && matches!(key, Key::ArrowUp | Key::ArrowDown) {
+        let up = key == Key::ArrowUp;
+        let step = if cmd { 10.0 } else { 2.0 };
+        if shift {
+            nudge_runs(app, id, &ed, |st, _| ("baselineShift", (st.baseline_shift_pt + if up { step } else { -step }).clamp(-1296.0, 1296.0)));
+        } else {
+            // Photoshop: ↑ brings lines closer, ↓ spreads them.
+            let auto = auto_leading(app, id);
+            nudge_runs(app, id, &ed, |st, k| {
+                let lead = st.leading_pt.unwrap_or(st.size_pt * auto) * k;
+                ("leading", ((lead + if up { -step } else { step }) / k).clamp(0.1, 5000.0))
+            });
+        }
+        return true;
+    }
+    if !(cmd && shift) {
+        return false;
+    }
+    let style = styles_at(app).map(|(c, _)| c);
+    let props = match (key, alt) {
+        (Key::L, false) => json!({"align": "left"}),
+        (Key::C, false) => json!({"align": "center"}),
+        (Key::R, false) => json!({"align": "right"}),
+        (Key::J, false) => json!({"align": "justify"}),
+        (Key::F, false) => json!({"align": "justifyAll"}),
+        (Key::Period | Key::Comma, _) => {
+            let step = if alt { 10.0 } else { 2.0 } * if key == Key::Period { 1.0 } else { -1.0 };
+            nudge_runs(app, id, &ed, |st, k| ("size", ((st.size_pt * k + step).clamp(1.0, 1296.0) / k).max(0.1)));
+            return true;
+        }
+        (Key::B, false) => json!({"fauxBold": !style.as_ref().is_some_and(|s| s.faux_bold)}),
+        (Key::I, false) => json!({"fauxItalic": !style.as_ref().is_some_and(|s| s.faux_italic)}),
+        (Key::U, false) => json!({"underline": !style.as_ref().is_some_and(|s| s.underline)}),
+        (Key::Slash | Key::Questionmark, false) => json!({"strikethrough": !style.as_ref().is_some_and(|s| s.strikethrough)}),
+        (Key::K, false) => {
+            let on = style.as_ref().is_some_and(|s| s.caps == photocraft_doc::text::Caps::AllCaps);
+            json!({"caps": if on { "normal" } else { "all" }})
+        }
+        (Key::H, false) => {
+            let on = style.as_ref().is_some_and(|s| s.caps == photocraft_doc::text::Caps::SmallCaps);
+            json!({"caps": if on { "normal" } else { "small" }})
+        }
+        (Key::X, false) => json!({"horizontalScale": 100}),
+        (Key::X, true) => json!({"verticalScale": 100}),
+        (Key::A, true) => json!({"leading": "auto"}),
+        (Key::Q, false) => json!({"tracking": 0}),
+        _ => return false,
+    };
+    if let Some(align) = props.get("align").and_then(serde_json::Value::as_str) {
+        app.ui.tool_options.type_align = align.into();
+    }
+    apply(app, ctx, props);
+    true
+}
+
+/// The paragraph auto-leading factor at the start of layer `id` (1.2 by default).
+fn auto_leading(app: &PhotocraftApp, id: LayerId) -> f32 {
+    app.session.active().and_then(|st| text_layer(&st.doc, id)).and_then(|t| t.paragraph_runs().into_iter().next()).map_or(1.2, |p| p.style.auto_leading)
+}
+
+/// Set one numeric character property run by run over the edit's scope (the selection, else all
+/// the text): `f(style, shown scale)` gives the key and the new value of each run, so a size step
+/// grows every run from its own size, as Photoshop does. One history step with the session.
+fn nudge_runs(app: &mut PhotocraftApp, id: LayerId, ed: &TextEdit, f: impl Fn(&photocraft_doc::text::CharStyle, f32) -> (&'static str, f32)) {
+    let Some(t) = app.session.active().and_then(|st| text_layer(&st.doc, id)).cloned() else { return };
+    let k = shown_scale(app);
+    let n = t.text.chars().count();
+    let (a, b) = (ed.caret.min(ed.anchor), ed.caret.max(ed.anchor));
+    let (a, b) = if a < b { (a, b) } else { (0, n) };
+    let (mut byte, mut start) = (0usize, 0usize);
+    let mut steps = Vec::new();
+    for run in t.char_runs() {
+        // Runs are measured in bytes; ranges in characters.
+        byte = byte.saturating_add(run.len).min(t.text.len());
+        let end = t.text.get(..byte).map_or(n, |head| head.chars().count());
+        let (s, e) = (start.max(a), end.min(b));
+        if s < e {
+            let (key, v) = f(&run.style, k);
+            steps.push(json!({"layer": id.0, "range": [s, e], key: v, "coalesce": ed.session}));
+        }
+        start = end;
+    }
+    for p in steps {
+        if let Err(e) = app.run("type.setStyle", p) {
+            app.ui.status = e;
+            app.ui.status_error = true;
+            return;
+        }
+    }
 }
 
 /// End the editing session. A new layer left empty is deleted; a new layer is named after its text.
@@ -1001,7 +1118,7 @@ pub fn options_bar(app: &mut PhotocraftApp, ui: &mut egui::Ui) {
     }
     let (r, _) = ui.allocate_exact_size(egui::vec2(18.0, 22.0), egui::Sense::hover());
     crate::icons::paint(ui, r, "type", 13.0, t.icon);
-    if crate::widgets::value_field(ui, &mut size, 1.0..=1296.0, "pt", 66.0).changed() {
+    if crate::widgets::value_field_committed(ui, &mut size, 1.0..=1296.0, "pt", 66.0).changed() {
         app.ui.tool_options.type_size = size;
         apply(app, ui.ctx(), json!({"size": size, "metricsAsShown": true}));
     }
@@ -1192,7 +1309,7 @@ fn num_field(ui: &mut egui::Ui, label: &str, tip: &str, v: f32, range: std::ops:
         let (r, resp) = ui.allocate_exact_size(egui::vec2(22.0, 22.0), egui::Sense::hover());
         ui.painter().text(r.center(), egui::Align2::CENTER_CENTER, label, crate::theme::semibold(10.0), t.text_dim);
         resp.on_hover_text(tip);
-        if crate::widgets::value_field(ui, &mut v, range, unit, width).changed() {
+        if crate::widgets::value_field_committed(ui, &mut v, range, unit, width).changed() {
             out = Some(v);
         }
     });

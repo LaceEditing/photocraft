@@ -43,7 +43,8 @@ fn has_clip_and_selection(s: &Session) -> std::result::Result<(), String> {
     d.doc.selection.as_ref().map(|_| ()).ok_or_else(|| "Paste Into needs a selection".into())
 }
 
-pub(crate) fn is_background(l: &Layer) -> bool {
+/// Is `l` the Background layer (named so, transparency- and position-locked pixels)?
+pub fn is_background(l: &Layer) -> bool {
     l.name == "Background" && l.locks.transparency && l.locks.position && matches!(l.content, LayerContent::Raster(_))
 }
 

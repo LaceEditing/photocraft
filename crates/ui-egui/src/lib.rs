@@ -485,6 +485,18 @@ pub struct PhotocraftApp {
     /// makes shortcut- and dialog-triggered commands pass the same policy as
     /// direct control calls.
     pub(crate) automation_input: bool,
+    /// This frame's Esc belongs to the text field or menu that had the keyboard last frame
+    /// (`shortcuts::field_escape`): egui drops the focus as Esc arrives, before the shortcuts run,
+    /// so without this the Esc that leaves a field also ended a type edit, a transform or a job.
+    pub(crate) field_escape: bool,
+    /// The mouse press under way closed a menu or drop-down (`shortcuts::dismiss_press`): the
+    /// canvas ignores it until it is released, as in Photoshop (a click on the canvas that closed
+    /// the font menu also started a new type layer).
+    pub(crate) dismiss_press: bool,
+    /// A button was released last frame (ends [`Self::dismiss_press`]).
+    pub(crate) released_last_frame: bool,
+    /// The path a Path Selection drag moves, taken at its press (`vector_ui::path_selection_press`).
+    pub(crate) path_drag: Option<vector_ui::PathTarget>,
     /// Levels/Curves histogram cache: (document, adjustment layer, revision it is valid for).
     pub(crate) tone_hist: Option<(DocId, photocraft_doc::LayerId, u64, std::sync::Arc<tone::Histograms>)>,
     /// Histogram panel cache: (document, revision, computed at ms, histograms).
@@ -631,6 +643,10 @@ impl PhotocraftApp {
             adjust_preview: None,
             synthetic: Vec::new(),
             automation_input: false,
+            field_escape: false,
+            dismiss_press: false,
+            released_last_frame: false,
+            path_drag: None,
             channel_thumbs: None,
             channel_views: HashMap::new(),
             type_layout: None,
@@ -1301,6 +1317,8 @@ impl eframe::App for PhotocraftApp {
             wheel_nav::fold_legacy_pinch(ctx, raw_input);
         }
         raw_input.events.extend(self.take_synthetic_step());
+        self.field_escape = shortcuts::field_escape(ctx, raw_input);
+        shortcuts::dismiss_press(self, ctx, raw_input);
         if self.custom_titlebar {
             titlebar::release_after_os_resize(ctx, raw_input);
         }

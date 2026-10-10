@@ -193,12 +193,21 @@ pub fn pill_tab(ui: &mut Ui, label: &str, selected: bool) -> Response {
 
 /// Monospace numeric field with a dimmed unit suffix, Photoshop style. Drag to scrub.
 pub fn value_field(ui: &mut Ui, value: &mut f32, range: std::ops::RangeInclusive<f32>, suffix: &str, width: f32) -> Response {
-    value_field_in(ui, value, range, suffix, width, 0.0).0
+    value_field_in(ui, value, range, suffix, width, 0.0, true).0
+}
+
+/// A [`value_field`] whose typed number applies when it is committed (Enter, Tab or a click
+/// elsewhere) and Esc puts the old value back, like Photoshop's Type options bar and Character
+/// panel: applied per keystroke, typing 72 set 7 pt first and Esc could not undo it. Scrubbing and
+/// the arrow keys still apply at once.
+pub fn value_field_committed(ui: &mut Ui, value: &mut f32, range: std::ops::RangeInclusive<f32>, suffix: &str, width: f32) -> Response {
+    value_field_in(ui, value, range, suffix, width, 0.0, false).0
 }
 
 /// A [`value_field`] that leaves `trailing` points free inside its box, right of the suffix, and
 /// returns the box with the number's response.
-fn value_field_in(ui: &mut Ui, value: &mut f32, range: std::ops::RangeInclusive<f32>, suffix: &str, width: f32, trailing: f32) -> (Response, Rect) {
+/// `live`: a typed number applies per keystroke (else when committed, see [`value_field_committed`]).
+fn value_field_in(ui: &mut Ui, value: &mut f32, range: std::ops::RangeInclusive<f32>, suffix: &str, width: f32, trailing: f32, live: bool) -> (Response, Rect) {
     let t = Tokens::get(ui.ctx());
     let (rect, slot) = ui.allocate_exact_size(vec2(width, 24.0), Sense::hover());
     surface(ui, rect, t.field, false);
@@ -210,7 +219,7 @@ fn value_field_in(ui: &mut Ui, value: &mut f32, range: std::ops::RangeInclusive<
     // Small ranges (gamma 0.01–9.99, 0–1 centres) need two decimals and a finer drag, like Photoshop.
     let fine = range.end() - range.start() <= 10.0;
     let (lo, hi) = (*range.start(), *range.end());
-    let (step, grid) = arrow_step(ui, slot.id, if fine { 0.01 } else { 1.0 });
+    let (step, grid) = arrow_step(ui, slot.id, if fine { 0.01 } else { 1.0 }, live);
     // new_child (not scope_builder): a scope would move the parent cursor back to the child rect.
     let mut child = ui.new_child(egui::UiBuilder::new().max_rect(field));
     let mut resp = {
@@ -224,7 +233,7 @@ fn value_field_in(ui: &mut Ui, value: &mut f32, range: std::ops::RangeInclusive<
             ui.style_mut().override_font_id = Some(theme::mono(12.0));
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 let layout = egui::Layout::centered_and_justified(ui.layout().main_dir());
-                ui.allocate_ui_with_layout(field.size(), layout, |ui| number_edit(ui, value, range, fine)).inner
+                ui.allocate_ui_with_layout(field.size(), layout, |ui| number_edit(ui, value, range, fine, live)).inner
             })
             .inner
         }
@@ -271,7 +280,7 @@ pub struct PopupFieldResponse {
 pub fn popup_value_field(ui: &mut Ui, name: &str, value: &mut f32, range: std::ops::RangeInclusive<f32>, suffix: &str, width: f32) -> PopupFieldResponse {
     let t = Tokens::get(ui.ctx());
     let (lo, hi) = (*range.start(), *range.end());
-    let (field, rect) = value_field_in(ui, value, range.clone(), suffix, width, POPUP_ARROW_W);
+    let (field, rect) = value_field_in(ui, value, range.clone(), suffix, width, POPUP_ARROW_W, true);
     let arrow = Rect::from_min_max(pos2(rect.right() - POPUP_ARROW_W - 2.0, rect.top() + 2.0), rect.max - vec2(2.0, 2.0));
     let resp = ui.interact(arrow, field.id.with("popup-slider"), Sense::click_and_drag());
     let name = name.trim_end_matches([':', '：']).to_string();
@@ -362,7 +371,7 @@ pub fn focus_first_field(ctx: &egui::Context, on: bool) {
 /// The number in a [`value_field`]. A typed number applies as it's typed; arithmetic waits for
 /// Enter, Tab or click-away, because per keystroke `5/2` would land first and a caller that
 /// rounds it would cut `5/2*2` short. `changed()` means a new value, not just a keystroke.
-fn number_edit(ui: &mut Ui, value: &mut f32, range: std::ops::RangeInclusive<f32>, fine: bool) -> Response {
+fn number_edit(ui: &mut Ui, value: &mut f32, range: std::ops::RangeInclusive<f32>, fine: bool, live: bool) -> Response {
     let (id, ctx) = (ui.next_auto_id(), ui.ctx().clone());
     // Focused before the DragValue is drawn, so it gains focus this frame and selects its text.
     if ui.data_mut(|d| d.remove_temp::<bool>(first_field_id())).unwrap_or(false) {
@@ -372,12 +381,21 @@ fn number_edit(ui: &mut Ui, value: &mut f32, range: std::ops::RangeInclusive<f32
     let math = ui.memory(|m| m.has_focus(id)) && ui.data(|d| d.get_temp(held)).unwrap_or(false);
     ui.data_mut(|d| d.insert_temp(held, math));
     let before = *value;
+    // egui counts a field as having just lost focus for two frames, but checks for Esc only on
+    // the first: the frame after Esc it applied the abandoned text anyway. Remember the Esc for
+    // one frame and put the value back if the DragValue applies anything then.
+    let (escaped, had_focus) = (id.with("escaped"), id.with("had-focus"));
+    let escaped_last_frame = ui.data_mut(|d| d.remove_temp::<bool>(escaped)).unwrap_or(false);
+    let focused_last_frame = ui.data_mut(|d| d.remove_temp::<bool>(had_focus)).unwrap_or(false);
+    if focused_last_frame && !ui.memory(|m| m.has_focus(id)) && ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+        ui.data_mut(|d| d.insert_temp(escaped, true));
+    }
     let mut resp = ui.add(
         egui::DragValue::new(value)
             .range(range)
             .speed(if fine { 0.01 } else { 0.5 })
             .custom_formatter(move |v, _| if fine { fmt_num2(v) } else { fmt_num(v) })
-            .update_while_editing(!math)
+            .update_while_editing(live && !math)
             // Focus is read when parsing, not above: Tab hands it on inside `ui.add`.
             .custom_parser(move |s| {
                 let v = parse_num(s);
@@ -389,13 +407,19 @@ fn number_edit(ui: &mut Ui, value: &mut f32, range: std::ops::RangeInclusive<f32
                 v
             }),
     );
+    if escaped_last_frame && !resp.has_focus() {
+        *value = before;
+    }
+    if resp.has_focus() {
+        ui.data_mut(|d| d.insert_temp(had_focus, true));
+    }
     resp.flags.set(egui::response::Flags::CHANGED, *value != before);
     resp
 }
 
 /// Increments a numerical field with the up/down arrow keys. Increments by 1 by default, 10 with shift, and 0.1 with ctrl/cmd.
 /// Returns the amount to add, and what to round the value to first.
-fn arrow_step(ui: &mut Ui, slot: egui::Id, step: f32) -> (f32, f32) {
+fn arrow_step(ui: &mut Ui, slot: egui::Id, step: f32, live: bool) -> (f32, f32) {
     use egui::{Key, Modifiers};
     // The field's id is only known once it's drawn, so `value_field` saves it under `slot` for the next frame.
     let Some(id) = ui.data(|d| d.get_temp::<egui::Id>(slot)).filter(|id| ui.memory(|m| m.has_focus(*id))) else {
@@ -413,8 +437,9 @@ fn arrow_step(ui: &mut Ui, slot: egui::Id, step: f32) -> (f32, f32) {
         }
         (n, grid)
     });
-    // If a sum like 5+5 has been typed, unfocus the field so it calculates it (as Enter would) before we step.
-    if n != 0.0 && ui.data(|d| d.get_temp(id.with("arithmetic"))).unwrap_or(false) {
+    // If a sum like 5+5 (or, in a field that applies on commit, any number) has been typed,
+    // unfocus the field so it applies it (as Enter would) before we step.
+    if n != 0.0 && (!live || ui.data(|d| d.get_temp(id.with("arithmetic"))).unwrap_or(false)) {
         ui.memory_mut(|m| m.surrender_focus(id));
     }
     (n, grid)
@@ -1347,6 +1372,37 @@ mod tests {
         h.key_press(egui::Key::Enter);
         h.run();
         assert_eq!(*h.state(), (25.0, 3));
+    }
+
+    /// The Type fields' number applies once committed, not per keystroke, and Esc puts it back.
+    #[test]
+    fn committed_value_field_applies_on_enter_and_esc_reverts() {
+        use egui_kittest::{Harness, kittest::Queryable};
+        let mut h = Harness::builder().with_size(egui::vec2(300.0, 100.0)).build_ui_state(
+            |ui, (v, changes): &mut (f32, u32)| {
+                if super::value_field_committed(ui, v, 1.0..=1296.0, "pt", 90.0).changed() {
+                    *changes += 1;
+                }
+            },
+            (48.0, 0),
+        );
+        let type_in = |h: &mut Harness<'_, (f32, u32)>, text: &str| {
+            h.get_by_role(egui::accesskit::Role::SpinButton).click();
+            h.run();
+            for c in text.chars() {
+                h.event(egui::Event::Text(c.to_string()));
+                h.run();
+            }
+        };
+        type_in(&mut h, "72");
+        assert_eq!(*h.state(), (48.0, 0), "nothing applies while typing");
+        h.key_press(egui::Key::Escape);
+        h.run();
+        assert_eq!(*h.state(), (48.0, 0), "Esc reverts");
+        type_in(&mut h, "60");
+        h.key_press(egui::Key::Enter);
+        h.run();
+        assert_eq!(*h.state(), (60.0, 1));
     }
 
     #[test]
